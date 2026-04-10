@@ -7,8 +7,13 @@ routes = [
   { pattern = "kingsland.network/", zone_name = "kingsland.network" },
 ]
 
-# Importa setup.sh como texto dentro do worker
+# Generate src/setup.sh.b64 before every dev/deploy. See scripts/build.sh
+# for the reason (Cloudflare edge WAF blocks raw shell-script uploads).
+[build]
+command = "bash scripts/build.sh"
+
+# Import src/setup.sh.b64 as a text module inside the worker.
 [[rules]]
 type = "Text"
-globs = ["**/*.sh"]
+globs = ["**/*.b64"]
 fallthrough = true
