@@ -69,6 +69,68 @@ run_quiet() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # ============================================================
+# Sudo handling
+# ============================================================
+# Several steps require administrator privileges (Homebrew installer,
+# brew casks, adding zsh to /etc/shells). The script must work both when
+# invoked directly (`bash setup.sh`) and when piped (`curl ... | bash`),
+# where stdin is the HTTP pipe and sudo cannot read the password from it.
+
+SUDO_KEEPALIVE_PID=""
+
+ensure_not_root() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    err "Do not run this script as root."
+    err "Run it as your normal user — sudo will be requested when needed."
+    err "Homebrew refuses to install under the root account."
+    exit 1
+  fi
+}
+
+# Prompt for the sudo password once (reading from /dev/tty when stdin is a
+# pipe), then spawn a background keepalive to refresh the timestamp so long
+# installs don't hit a password prompt mid-way.
+ensure_sudo() {
+  header "Administrator privileges"
+
+  if ! have sudo; then
+    err "sudo not found on PATH."
+    exit 1
+  fi
+
+  if sudo -n true 2>/dev/null; then
+    ok_line "sudo already authenticated (cached or passwordless)"
+  else
+    sub "Parts of this setup need administrator privileges"
+    info "You will be prompted for your password once."
+    if [[ -t 0 ]]; then
+      sudo -v || { err "sudo authentication failed"; exit 1; }
+    elif [[ -r /dev/tty ]]; then
+      sudo -v </dev/tty || { err "sudo authentication failed"; exit 1; }
+    else
+      err "No terminal available to read the sudo password."
+      err "Re-run without piping the script to bash:"
+      err "  curl -fsSL https://kingsland.network/setup.sh -o /tmp/setup.sh && bash /tmp/setup.sh"
+      exit 1
+    fi
+    ok_line "sudo authenticated"
+  fi
+
+  # Keepalive: refresh the sudo timestamp every 50s while the parent runs.
+  ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || true; sleep 50; done ) &
+  SUDO_KEEPALIVE_PID=$!
+  disown "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  trap cleanup_sudo EXIT INT TERM
+}
+
+cleanup_sudo() {
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
+  fi
+}
+
+# ============================================================
 # Contadores p/ resumo final
 # ============================================================
 COUNT_INSTALLED=0
@@ -304,8 +366,14 @@ post_install() {
   zsh_bin="$(command -v zsh || true)"
   if [[ -n "$zsh_bin" ]]; then
     if ! grep -qx "$zsh_bin" /etc/shells 2>/dev/null; then
-      sub "Adicionando $zsh_bin em /etc/shells (sudo)"
-      echo "$zsh_bin" | sudo tee -a /etc/shells >/dev/null || warn "não foi possível atualizar /etc/shells"
+      sub "Adding $zsh_bin to /etc/shells (sudo)"
+      # -n: rely on the cached credentials from ensure_sudo; fail loudly
+      # instead of hanging on a password prompt if the cache expired.
+      if echo "$zsh_bin" | sudo -n tee -a /etc/shells >/dev/null; then
+        ok_line "$zsh_bin added to /etc/shells"
+      else
+        warn "could not update /etc/shells (sudo cache expired?)"
+      fi
     fi
     local current_shell
     current_shell="$(dscl . -read "/Users/$USER" UserShell 2>/dev/null | awk '{print $2}')"
@@ -501,7 +569,9 @@ print_summary() {
 # Main
 # ============================================================
 print_banner
+ensure_not_root
 preflight
+ensure_sudo
 install_homebrew
 install_taps
 install_formulas
