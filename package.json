@@ -1,0 +1,16 @@
+{
+  "name": "kingsland-setup",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker que serve o script de setup do macOS em https://kingsland.network/setup.sh",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "login": "wrangler login",
+    "whoami": "wrangler whoami"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

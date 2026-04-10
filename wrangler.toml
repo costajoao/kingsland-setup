@@ -1,0 +1,14 @@
+name = "kingsland-setup"
+main = "src/worker.js"
+compatibility_date = "2026-04-10"
+
+routes = [
+  { pattern = "kingsland.network/setup.sh", zone_name = "kingsland.network" },
+  { pattern = "kingsland.network/", zone_name = "kingsland.network" },
+]
+
+# Importa setup.sh como texto dentro do worker
+[[rules]]
+type = "Text"
+globs = ["**/*.sh"]
+fallthrough = true
