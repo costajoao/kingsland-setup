@@ -428,9 +428,8 @@ SAVEHIST=50000
 setopt HIST_IGNORE_ALL_DUPS     # drop older duplicates
 setopt HIST_IGNORE_SPACE        # skip commands starting with space
 setopt HIST_REDUCE_BLANKS       # trim whitespace
-setopt SHARE_HISTORY            # share history across sessions
+setopt SHARE_HISTORY            # share history across sessions (also appends immediately)
 setopt EXTENDED_HISTORY         # save timestamps
-setopt INC_APPEND_HISTORY       # append immediately
 
 # ============================================================
 # Zsh options (sane defaults, ex-OMZ)
@@ -446,7 +445,10 @@ setopt PROMPT_SUBST             # allow $() in prompt
 # ============================================================
 # Completions (cached compinit for fast startup)
 # ============================================================
-fpath=(/opt/homebrew/share/zsh/site-functions $fpath)
+# Docker CLI completions live here too, so compinit runs once and keeps its
+# cache. If Docker Desktop appends its own "compinit" block to this file,
+# delete it: an uncached compinit on every shell costs ~400 ms.
+fpath=(/opt/homebrew/share/zsh/site-functions $HOME/.docker/completions $fpath)
 
 autoload -Uz compinit
 # Full compinit if dump is missing or older than 24h, else fast cached load
@@ -472,25 +474,42 @@ bindkey '^[[A' up-line-or-beginning-search     # Up arrow
 bindkey '^[[B' down-line-or-beginning-search   # Down arrow
 
 # ============================================================
-# NVM (lazy-load — shims for nvm/node/npm/npx)
+# NVM (lazy: default Node on PATH, nvm.sh loaded on first `nvm`)
 # ============================================================
+# The default Node goes straight onto PATH, resolved from nvm's own "default"
+# alias (so `nvm alias default X` still takes effect), and nvm.sh (~300 ms)
+# loads only the first time `nvm` is called. Unlike node/npm shim functions,
+# this keeps `#!/usr/bin/env node` scripts and child processes working.
 export NVM_DIR="$HOME/.nvm"
-_load_nvm() {
-  unset -f nvm node npm npx
-  [ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && \. "/opt/homebrew/opt/nvm/nvm.sh"
-  [ -s "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm" ] && \. "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm"
-  [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+() {
+  local alias_file="$NVM_DIR/alias/default" want=""
+  [[ -r $alias_file ]] && want=$(<$alias_file)
+  want=${want#v}
+  local -a dirs
+  dirs=($NVM_DIR/versions/node/v${want}*(N/nOn))             # newest match first
+  (( ${#dirs} )) || dirs=($NVM_DIR/versions/node/v*(N/nOn))  # alias like lts/*: newest installed
+  (( ${#dirs} )) && path=($dirs[1]/bin $path)
 }
-nvm()  { _load_nvm; nvm "$@"; }
-node() { _load_nvm; node "$@"; }
-npm()  { _load_nvm; npm "$@"; }
-npx()  { _load_nvm; npx "$@"; }
+nvm() {
+  unfunction nvm
+  [ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && \. "/opt/homebrew/opt/nvm/nvm.sh"
+  nvm "$@"
+}
 
 # ============================================================
 # Modern tools
 # ============================================================
-# Starship prompt
-eval "$(starship init zsh)"
+# Starship prompt: its init script is cached and rebuilt only when the
+# starship binary is newer than the cache (i.e. after an upgrade).
+() {
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/starship-init.zsh"
+  local bin="${commands[starship]}"
+  [[ -n $bin ]] || return
+  if [[ ! -s $cache || $bin -nt $cache ]]; then
+    mkdir -p "${cache:h}" && starship init zsh --print-full-init >| "$cache"
+  fi
+  source "$cache"
+}
 
 # zoxide — smarter cd (use `z <partial>`, e.g. `z govhub`)
 eval "$(zoxide init zsh)"
@@ -510,6 +529,7 @@ export FZF_ALT_C_COMMAND='fd --type d --hidden --follow --exclude .git'
 # Aliases
 # ============================================================
 alias vegas='ssh costa@10.0.2.5'
+alias costa-agent='ssh costa@10.30.15.222'
 alias pn='pnpm'
 
 # eza (modern ls)
@@ -530,6 +550,18 @@ alias gcb='git checkout -b'
 alias gp='git push'
 alias gl='git pull'
 alias glog='git log --oneline --graph --decorate'
+
+# ============================================================
+# GitHub Packages
+# ============================================================
+# pnpm/npm read NODE_AUTH_TOKEN via .npmrc. Exported in every shell. Source: a
+# read:packages-only PAT in the macOS keychain, stored once with
+#   security add-generic-password -U -a "$USER" -s NODE_AUTH_TOKEN -w
+# An empty or missing entry falls back to the gh token (broader scopes).
+# The token is never stored in this file.
+NODE_AUTH_TOKEN=$(security find-generic-password -a "$USER" -s NODE_AUTH_TOKEN -w 2>/dev/null)
+[[ -n $NODE_AUTH_TOKEN ]] || NODE_AUTH_TOKEN=$(gh auth token 2>/dev/null)
+export NODE_AUTH_TOKEN
 ZSHRC_EOF
 
   if [[ -f "$zshrc" ]] && cmp -s "$tmp" "$zshrc"; then
