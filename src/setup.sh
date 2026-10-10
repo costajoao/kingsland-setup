@@ -4,6 +4,13 @@
 #   curl -fsSL https://kingsland.network/setup.sh | bash
 #   # ou, para partes interativas (chsh/sudo):
 #   curl -fsSL https://kingsland.network/setup.sh -o /tmp/setup.sh && bash /tmp/setup.sh
+#
+# Antes de instalar, um menu pergunta quais grupos instalar. Sem menu:
+#   ... | bash -s -- --yes                  # padrões (tudo, menos mobile)
+#   ... | bash -s -- --all                  # todos os grupos
+#   ... | bash -s -- --groups=mobile,java   # só esses (o núcleo sempre entra)
+#
+# Must stay bash 3.2 compatible: `curl | bash` runs macOS's /bin/bash.
 
 set -uo pipefail
 
@@ -50,10 +57,12 @@ render_item() {
 }
 
 # Executa um comando, escondendo o output; em caso de falha, imprime o log.
+# stdin comes from /dev/null: under `curl | bash` stdin IS the rest of this
+# script, and a child that reads it (an installer prompt) would swallow it.
 run_quiet() {
   local logfile
   logfile="$(mktemp)"
-  if "$@" >"$logfile" 2>&1; then
+  if "$@" </dev/null >"$logfile" 2>&1; then
     rm -f "$logfile"
     return 0
   else
@@ -198,150 +207,237 @@ install_homebrew() {
   else
     sub "Instalando Homebrew"
     NONINTERACTIVE=1 /bin/bash -c \
-      "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
     ok_line "Homebrew instalado"
   fi
   if [[ -x "$BREW_PREFIX/bin/brew" ]]; then
     eval "$("$BREW_PREFIX/bin/brew" shellenv)"
   fi
+  # One update up front, then none per install (brew would otherwise refresh
+  # its index before every `brew install`).
+  sub "Atualizando índice do Homebrew"
+  run_quiet brew update || warn "brew update falhou; seguindo com o índice atual"
+  export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1
 }
 
 # ============================================================
-# Taps
+# Grupos (menu de seleção)
 # ============================================================
-install_taps() {
-  local taps=(oven-sh/bun)
-  header "Taps"
-  local current_taps
-  current_taps="$(brew tap 2>/dev/null || true)"
-  local i=0 total=${#taps[@]}
-  for t in "${taps[@]}"; do
-    i=$((i+1))
-    if printf "%s\n" "$current_taps" | grep -qx "$t"; then
-      render_item "$i" "$total" "$t" "skipped" "$C_DIM"
-      COUNT_SKIPPED=$((COUNT_SKIPPED+1))
-    else
-      render_item "$i" "$total" "$t" "tapping…" "$C_YELLOW"
-      if run_quiet brew tap "$t"; then
-        tput cuu1 2>/dev/null && tput el 2>/dev/null || true
-        render_item "$i" "$total" "$t" "tapped" "$C_GREEN"
-        COUNT_INSTALLED=$((COUNT_INSTALLED+1))
-      else
-        render_item "$i" "$total" "$t" "failed" "$C_RED"
-        COUNT_FAILED=$((COUNT_FAILED+1))
-        FAILED_ITEMS+=("tap:$t")
-      fi
-    fi
+# One entry per group, in parallel arrays (bash 3.2 has no associative
+# arrays). Package lists are space-separated. "core" is always installed.
+GROUP_IDS=(core mobile java go bun python db docker media network ai dotfiles shell)
+GROUP_LABELS=(
+  "Núcleo (git, gh, fzf, ripgrep, starship, nvm …)"
+  "Mobile / Android (Android Studio, SDK, apktool)"
+  "Java (OpenJDK 21, Maven)"
+  "Go (go, golang-migrate, overmind)"
+  "Bun"
+  "Python tooling (pipx, yamllint)"
+  "Bancos de dados (psql/libpq, Redis Desktop Manager)"
+  "Docker Compose (CLI)"
+  "Mídia e imagens (ffmpeg, webp, librsvg, Inkscape …)"
+  "Rede local (mkcert, ngrok)"
+  "IA (Goose)"
+  "Escrever ~/.zshrc (o atual vira backup)"
+  "Definir zsh como shell padrão"
+)
+GROUP_DEFAULT=(1 0 1 1 1 1 1 1 1 1 1 1 1)
+GROUP_TAPS=("" "" "" "" "oven-sh/bun" "" "" "" "" "" "" "" "")
+GROUP_FORMULAS=(
+  "bat coreutils eza fd fzf gcc gh git htop jq nvm pkgconf ripgrep sshs starship tree wget zoxide"
+  "apktool"
+  "openjdk@21 maven"
+  "go golang-migrate overmind"
+  "oven-sh/bun/bun"
+  "pipx yamllint"
+  "libpq"
+  "docker-compose"
+  "ffmpeg libpaper librsvg netpbm webp"
+  "mkcert"
+  ""
+  ""
+  ""
+)
+GROUP_CASKS=(
+  ""
+  "android-commandlinetools android-platform-tools android-studio"
+  ""
+  ""
+  ""
+  ""
+  "another-redis-desktop-manager"
+  ""
+  "inkscape"
+  "ngrok"
+  "block-goose"
+  ""
+  ""
+)
+GROUP_SELECTED=("${GROUP_DEFAULT[@]}")
+
+group_index() {
+  local i
+  for i in "${!GROUP_IDS[@]}"; do
+    [[ "${GROUP_IDS[$i]}" == "$1" ]] && { echo "$i"; return 0; }
+  done
+  return 1
+}
+group_on() { local i; i="$(group_index "$1")" && [[ "${GROUP_SELECTED[$i]}" == 1 ]]; }
+
+# --yes / --all / --groups=a,b (non-interactive). Unknown flags abort.
+SELECTION_MODE="menu"
+parse_args() {
+  local arg i id
+  for arg in "$@"; do
+    case "$arg" in
+      --yes|-y) SELECTION_MODE="defaults" ;;
+      --all)
+        SELECTION_MODE="flags"
+        for i in "${!GROUP_IDS[@]}"; do GROUP_SELECTED[$i]=1; done ;;
+      --groups=*)
+        SELECTION_MODE="flags"
+        for i in "${!GROUP_IDS[@]}"; do GROUP_SELECTED[$i]=0; done
+        GROUP_SELECTED[0]=1
+        local list="${arg#--groups=}"
+        local IFS=,
+        for id in $list; do
+          if i="$(group_index "$id")"; then
+            GROUP_SELECTED[$i]=1
+          else
+            err "grupo desconhecido: $id (válidos: ${GROUP_IDS[*]})"; exit 1
+          fi
+        done ;;
+      -h|--help)
+        printf "Uso: setup.sh [--yes | --all | --groups=%s]\n" "$(IFS=,; echo "${GROUP_IDS[*]}")"
+        exit 0 ;;
+      *) err "opção desconhecida: $arg"; exit 1 ;;
+    esac
+  done
+}
+
+# Checkbox menu. Reads from /dev/tty because stdin is the script under
+# `curl | bash`. Numbers toggle (several per line), "a"/"n" select all/none,
+# Enter installs. No terminal → defaults.
+select_groups() {
+  header "O que instalar"
+  if [[ "$SELECTION_MODE" != "menu" ]]; then
+    ok_line "seleção por opção de linha de comando"
+  elif [[ ! -r /dev/tty ]] || ! { true </dev/tty; } 2>/dev/null; then
+    warn "sem terminal para o menu; usando os padrões"
+  else
+    local i reply n
+    while true; do
+      for i in "${!GROUP_IDS[@]}"; do
+        local box="[ ]" color="$C_DIM"
+        if [[ "${GROUP_SELECTED[$i]}" == 1 ]]; then box="[x]"; color="$C_GREEN"; fi
+        if (( i == 0 )); then
+          printf "  ${C_DIM}  -${C_RESET} ${color}%s${C_RESET} %s ${C_DIM}(sempre)${C_RESET}\n" "$box" "${GROUP_LABELS[$i]}"
+        else
+          printf "  ${C_BOLD}%3d${C_RESET} ${color}%s${C_RESET} %s\n" "$i" "$box" "${GROUP_LABELS[$i]}"
+        fi
+      done
+      printf "\n  Números para marcar/desmarcar (ex: ${C_CYAN}1 3${C_RESET}), ${C_CYAN}a${C_RESET} todos, ${C_CYAN}n${C_RESET} nenhum, ${C_CYAN}Enter${C_RESET} para instalar: "
+      IFS= read -r reply </dev/tty || reply=""
+      [[ -z "$reply" ]] && break
+      case "$reply" in
+        a|A) for i in "${!GROUP_IDS[@]}"; do GROUP_SELECTED[$i]=1; done ;;
+        n|N) for i in "${!GROUP_IDS[@]}"; do GROUP_SELECTED[$i]=0; done; GROUP_SELECTED[0]=1 ;;
+        *)
+          for n in $reply; do
+            if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n < ${#GROUP_IDS[@]} )); then
+              GROUP_SELECTED[$n]=$(( 1 - GROUP_SELECTED[$n] ))
+            else
+              warn "ignorado: $n"
+            fi
+          done ;;
+      esac
+      printf "\n"
+    done
+  fi
+
+  # Android needs a JDK: selecting mobile pulls Java in.
+  if group_on mobile && ! group_on java; then
+    GROUP_SELECTED[$(group_index java)]=1
+    info "Java incluído automaticamente (necessário para Android)"
+  fi
+
+  local chosen=()
+  for i in "${!GROUP_IDS[@]}"; do
+    [[ "${GROUP_SELECTED[$i]}" == 1 ]] && chosen+=("${GROUP_IDS[$i]}")
+  done
+  ok_line "grupos: ${chosen[*]}"
+}
+
+# Flatten the selected groups into TAPS / FORMULAS / CASKS.
+TAPS=() FORMULAS=() CASKS=()
+collect_packages() {
+  local i p
+  for i in "${!GROUP_IDS[@]}"; do
+    [[ "${GROUP_SELECTED[$i]}" == 1 ]] || continue
+    for p in ${GROUP_TAPS[$i]}; do TAPS+=("$p"); done
+    for p in ${GROUP_FORMULAS[$i]}; do FORMULAS+=("$p"); done
+    for p in ${GROUP_CASKS[$i]}; do CASKS+=("$p"); done
   done
 }
 
 # ============================================================
-# Formulas
+# Instalação (taps, formulas, casks)
 # ============================================================
-install_formulas() {
-  local formulas=(
-    apktool
-    bat
-    coreutils
-    docker-compose
-    eza
-    fd
-    ffmpeg
-    fzf
-    gcc
-    gh
-    git
-    go
-    golang-migrate
-    htop
-    jq
-    libpaper
-    libpq
-    librsvg
-    maven
-    mkcert
-    netpbm
-    nvm
-    openjdk@21
-    oven-sh/bun/bun
-    overmind
-    pipx
-    pkgconf
-    ripgrep
-    sshs
-    starship
-    tree
-    webp
-    wget
-    yamllint
-    zoxide
-  )
+# install_list <kind> <title> items... ; kind = tap | formula | cask.
+# Failed items get one retry after the loop (downloads fail transiently).
+install_list() {
+  local kind=$1 title=$2; shift 2
+  local items=("$@")
+  (( ${#items[@]} )) || return 0
+  header "$title (${#items[@]})"
 
-  header "Formulas (${#formulas[@]})"
-  local installed_list
-  installed_list="$(brew list --formula -1 2>/dev/null || true)"
+  local present=""
+  case "$kind" in
+    tap)     present="$(brew tap 2>/dev/null || true)" ;;
+    formula) present="$(brew list --formula -1 2>/dev/null || true)" ;;
+    cask)    present="$(brew list --cask -1 2>/dev/null || true)" ;;
+  esac
 
-  local i=0 total=${#formulas[@]}
-  for f in "${formulas[@]}"; do
+  local i=0 total=${#items[@]} item name failed=()
+  for item in "${items[@]}"; do
     i=$((i+1))
-    local short="${f##*/}"
-    if printf "%s\n" "$installed_list" | grep -qx "$short"; then
-      render_item "$i" "$total" "$short" "already installed" "$C_DIM"
+    name="$item"; [[ "$kind" == tap ]] || name="${item##*/}"
+    if printf "%s\n" "$present" | grep -qx "$name"; then
+      render_item "$i" "$total" "$name" "already installed" "$C_DIM"
       COUNT_SKIPPED=$((COUNT_SKIPPED+1))
       continue
     fi
-
-    render_item "$i" "$total" "$short" "installing…" "$C_YELLOW"
-    if run_quiet brew install "$f"; then
+    render_item "$i" "$total" "$name" "installing…" "$C_YELLOW"
+    if brew_install "$kind" "$item"; then
       tput cuu1 2>/dev/null && tput el 2>/dev/null || true
-      render_item "$i" "$total" "$short" "installed" "$C_GREEN"
+      render_item "$i" "$total" "$name" "installed" "$C_GREEN"
       COUNT_INSTALLED=$((COUNT_INSTALLED+1))
     else
-      render_item "$i" "$total" "$short" "failed" "$C_RED"
+      render_item "$i" "$total" "$name" "failed, retrying later" "$C_YELLOW"
+      failed+=("$item")
+    fi
+  done
+
+  for item in ${failed[@]+"${failed[@]}"}; do
+    name="$item"; [[ "$kind" == tap ]] || name="${item##*/}"
+    sub "Nova tentativa: $name"
+    if brew_install "$kind" "$item"; then
+      ok_line "$name instalado na segunda tentativa"
+      COUNT_INSTALLED=$((COUNT_INSTALLED+1))
+    else
+      err "$name falhou duas vezes"
       COUNT_FAILED=$((COUNT_FAILED+1))
-      FAILED_ITEMS+=("formula:$f")
+      FAILED_ITEMS+=("$kind:$item")
     fi
   done
 }
 
-# ============================================================
-# Casks
-# ============================================================
-install_casks() {
-  local casks=(
-    android-commandlinetools
-    android-platform-tools
-    android-studio
-    another-redis-desktop-manager
-    block-goose
-    inkscape
-    ngrok
-  )
-
-  header "Casks (${#casks[@]})"
-  local installed_list
-  installed_list="$(brew list --cask -1 2>/dev/null || true)"
-
-  local i=0 total=${#casks[@]}
-  for c in "${casks[@]}"; do
-    i=$((i+1))
-    if printf "%s\n" "$installed_list" | grep -qx "$c"; then
-      render_item "$i" "$total" "$c" "already installed" "$C_DIM"
-      COUNT_SKIPPED=$((COUNT_SKIPPED+1))
-      continue
-    fi
-
-    render_item "$i" "$total" "$c" "installing…" "$C_YELLOW"
-    if run_quiet brew install --cask "$c"; then
-      tput cuu1 2>/dev/null && tput el 2>/dev/null || true
-      render_item "$i" "$total" "$c" "installed" "$C_GREEN"
-      COUNT_INSTALLED=$((COUNT_INSTALLED+1))
-    else
-      render_item "$i" "$total" "$c" "failed" "$C_RED"
-      COUNT_FAILED=$((COUNT_FAILED+1))
-      FAILED_ITEMS+=("cask:$c")
-    fi
-  done
+brew_install() {
+  case "$1" in
+    tap)     run_quiet brew tap "$2" ;;
+    formula) run_quiet brew install "$2" ;;
+    cask)    run_quiet brew install --cask "$2" ;;
+  esac
 }
 
 # ============================================================
@@ -364,7 +460,9 @@ post_install() {
 
   local zsh_bin
   zsh_bin="$(command -v zsh || true)"
-  if [[ -n "$zsh_bin" ]]; then
+  if ! group_on shell; then
+    info "shell padrão: não alterado (grupo desmarcado)"
+  elif [[ -n "$zsh_bin" ]]; then
     if ! grep -qx "$zsh_bin" /etc/shells 2>/dev/null; then
       sub "Adding $zsh_bin to /etc/shells (sudo)"
       # -n: rely on the cached credentials from ensure_sudo; fail loudly
@@ -381,8 +479,12 @@ post_install() {
       ok_line "zsh já é o shell padrão"
     else
       sub "Definindo zsh como shell padrão"
-      chsh -s "$zsh_bin" && ok_line "shell padrão atualizado" \
-        || warn "rode manualmente: chsh -s $zsh_bin"
+      # chsh asks for the password: read it from the terminal, not the pipe.
+      if [[ -r /dev/tty ]] && chsh -s "$zsh_bin" </dev/tty; then
+        ok_line "shell padrão atualizado"
+      else
+        warn "rode manualmente: chsh -s $zsh_bin"
+      fi
     fi
   fi
 }
@@ -392,6 +494,10 @@ post_install() {
 # ============================================================
 write_zshrc() {
   header "Dotfiles"
+  if ! group_on dotfiles; then
+    info "~/.zshrc: não alterado (grupo desmarcado)"
+    return 0
+  fi
   local zshrc="$HOME/.zshrc"
   local tmp
   tmp="$(mktemp)"
@@ -554,14 +660,14 @@ alias glog='git log --oneline --graph --decorate'
 # ============================================================
 # GitHub Packages
 # ============================================================
-# pnpm/npm read NODE_AUTH_TOKEN via .npmrc. Exported in every shell. Source: a
+# pnpm/npm read NODE_AUTH_TOKEN via .npmrc. Exported in every shell from a
 # read:packages-only PAT in the macOS keychain, stored once with
 #   security add-generic-password -U -a "$USER" -s NODE_AUTH_TOKEN -w
-# An empty or missing entry falls back to the gh token (broader scopes).
-# The token is never stored in this file.
+# Deliberately no fallback to `gh auth token`: that token carries the user's
+# full scopes (repo, admin…) and would reach every process. No keychain entry,
+# no variable. The token is never stored in this file.
 NODE_AUTH_TOKEN=$(security find-generic-password -a "$USER" -s NODE_AUTH_TOKEN -w 2>/dev/null)
-[[ -n $NODE_AUTH_TOKEN ]] || NODE_AUTH_TOKEN=$(gh auth token 2>/dev/null)
-export NODE_AUTH_TOKEN
+if [[ -n $NODE_AUTH_TOKEN ]]; then export NODE_AUTH_TOKEN; else unset NODE_AUTH_TOKEN; fi
 ZSHRC_EOF
 
   if [[ -f "$zshrc" ]] && cmp -s "$tmp" "$zshrc"; then
@@ -600,14 +706,25 @@ print_summary() {
 # ============================================================
 # Main
 # ============================================================
-print_banner
-ensure_not_root
-preflight
-ensure_sudo
-install_homebrew
-install_taps
-install_formulas
-install_casks
-post_install
-write_zshrc
-print_summary
+# Everything runs from main(), called on the last line: under `curl | bash`
+# bash reads the script from the pipe as it goes, so top-level calls not yet
+# read could be swallowed by any child that reads stdin, and the run would
+# stop silently halfway (it took three runs to finish on one machine).
+main() {
+  parse_args "$@"
+  print_banner
+  ensure_not_root
+  preflight
+  select_groups
+  collect_packages
+  ensure_sudo
+  install_homebrew
+  install_list tap "Taps" ${TAPS[@]+"${TAPS[@]}"}
+  install_list formula "Formulas" ${FORMULAS[@]+"${FORMULAS[@]}"}
+  install_list cask "Casks" ${CASKS[@]+"${CASKS[@]}"}
+  post_install
+  write_zshrc
+  print_summary
+}
+
+main "$@"
