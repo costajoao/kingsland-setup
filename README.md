@@ -32,6 +32,7 @@ responder: two source files, one config file, and no runtime fetching.
 - **One-liner install** — `curl | bash` on a fresh Mac, with proper sudo handling
 - **Idempotent** — detects what's already installed and skips it; safe to re-run
 - **Zero surprises** — no KV, no asset storage, no runtime fetch; the script is inlined at build time
+- **Pick what you need** — a checkbox menu before anything installs (mobile/Android is off by default)
 - **Curated stack** — Homebrew, ~35 formulas, a handful of casks, and a polished `zsh`
 - **Pretty output** — progress counters, per-item status, final summary
 - **Safe sudo** — prompts once, refreshes in the background, refuses to run as root
@@ -52,19 +53,50 @@ first:
 curl -fsSL https://kingsland.network/setup.sh -o /tmp/setup.sh && bash /tmp/setup.sh
 ```
 
+### Choosing what to install
+
+Before installing, the script shows a checkbox menu of groups. Type numbers to
+toggle (several at once, e.g. `1 3`), `a` for all, `n` for none, and Enter to
+start. The core group is always installed.
+
+| Group      | Contents                                                        | Default |
+| ---------- | --------------------------------------------------------------- | ------- |
+| `core`     | git, gh, fzf, ripgrep, fd, bat, eza, jq, starship, zoxide, nvm … | always  |
+| `mobile`   | Android Studio, Android SDK command-line and platform tools, apktool (pulls in `java`) | off |
+| `java`     | OpenJDK 21, Maven                                               | on      |
+| `go`       | go, golang-migrate, overmind                                    | on      |
+| `bun`      | Bun (via the `oven-sh/bun` tap)                                 | on      |
+| `python`   | pipx, yamllint                                                  | on      |
+| `db`       | libpq (`psql`), Another Redis Desktop Manager                   | on      |
+| `docker`   | docker-compose CLI                                              | on      |
+| `media`    | ffmpeg, webp, librsvg, netpbm, libpaper, Inkscape               | on      |
+| `network`  | mkcert, ngrok                                                   | on      |
+| `ai`       | Goose                                                           | on      |
+| `dotfiles` | Write `~/.zshrc` (the current one is backed up)                 | on      |
+| `shell`    | Make `zsh` the default shell                                    | on      |
+
+Without the menu (CI, scripts):
+
+```sh
+curl -fsSL https://kingsland.network/setup.sh | bash -s -- --yes                 # defaults
+curl -fsSL https://kingsland.network/setup.sh | bash -s -- --all                 # everything
+curl -fsSL https://kingsland.network/setup.sh | bash -s -- --groups=mobile,java  # core + these
+```
+
 ## What the script does
 
 | Stage          | Action                                                                   |
 | -------------- | ------------------------------------------------------------------------ |
 | Preflight      | Verifies macOS, detects architecture, installs Xcode Command Line Tools  |
+| Selection      | Checkbox menu of groups (or `--yes` / `--all` / `--groups=`)             |
 | Sudo           | Prompts once, refreshes credentials in the background, refuses root      |
-| Homebrew       | Installs Homebrew if missing, then loads `shellenv`                      |
+| Homebrew       | Installs Homebrew if missing, loads `shellenv`, updates its index once   |
 | Taps           | Adds required taps (currently `oven-sh/bun`)                             |
 | Formulas       | Installs a curated list of CLI tools (git, gh, fzf, ripgrep, starship …) |
 | Casks          | Installs GUI apps (Android Studio, Inkscape, ngrok …)                    |
 | Post-install   | Configures `fzf` key-bindings, sets `zsh` as the default shell           |
 | Dotfiles       | Writes a consolidated `~/.zshrc` (any existing file is backed up first); starts in ~0.1 s, and exports `NODE_AUTH_TOKEN` from the keychain (`security add-generic-password -U -a "$USER" -s NODE_AUTH_TOKEN -w`) |
-| Summary        | Prints counts of installed / skipped / failed items                      |
+| Summary        | Prints counts of installed / skipped / failed items (each failure is retried once first) |
 
 ## Requirements
 

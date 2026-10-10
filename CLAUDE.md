@@ -31,6 +31,12 @@ Two files in `src/` and one config file do everything — and the mechanism conn
 
 Work in `src/setup.sh`. It already defines its own UI helpers (`header`, `sub`, `render_item`, `run_quiet`, `have`) and tracks `COUNT_INSTALLED / COUNT_SKIPPED / COUNT_FAILED / FAILED_ITEMS` for the final summary — reuse these rather than inventing new output primitives. The script runs with `set -uo pipefail` (no `-e`): individual steps are expected to check their own failure and update counters.
 
+Three rules the script depends on:
+
+- **Everything runs from `main()`, called on the last line.** Under `curl | bash`, bash reads the script from the pipe as it executes; a child process that reads stdin (an installer prompt) would swallow the not-yet-read top-level lines and the run would stop silently halfway. That is why `run_quiet` and the Homebrew installer get `</dev/null`, and why anything interactive (`chsh`, the menu) reads `/dev/tty`. Never add top-level calls after `main "$@"`.
+- **bash 3.2.** `curl | bash` runs macOS's `/bin/bash` 3.2: no associative arrays, `mapfile`, `${var,,}` or negative indexes. Packages are grouped in parallel arrays (`GROUP_IDS`, `GROUP_LABELS`, `GROUP_DEFAULT`, `GROUP_TAPS`, `GROUP_FORMULAS`, `GROUP_CASKS`); a new package goes in one group's string, a new group adds one entry to every array at the same index. Check with `/bin/bash -n src/setup.sh`.
+- **Empty arrays under `set -u`** are expanded as `${arr[@]+"${arr[@]}"}`, or bash 3.2 aborts with "unbound variable".
+
 The script must stay **idempotent** — every step should detect what's already installed (`have <cmd>`, file existence checks, etc.) and skip instead of re-running. This is the load-bearing invariant for `curl ... | bash` usage.
 
 After editing `src/setup.sh`, `pnpm run dev` and hit `http://localhost:8787/setup.sh` to verify the served content before deploying.
